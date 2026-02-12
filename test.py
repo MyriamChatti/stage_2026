@@ -9,6 +9,7 @@ import torch
 import time
 import datetime
 import numpy as np
+import matplotlib.cm as cm
 
 from torch.utils.data import DataLoader
 from scipy.ndimage import median_filter
@@ -117,29 +118,29 @@ def extract_contours(mask):
     return contours
 
 #superposition du masque
+
 def overlay_multiclass(image_gray, labels):
 
     image_rgb = np.stack([image_gray]*3, axis=-1)
     overlay = image_rgb.copy()
 
-    colors = [
-        [255,0,0],     # rouge
-        [0,255,0],     # vert
-        [0,0,255],     # bleu
-        [255,255,0],   # jaune
-        [255,0,255],   # magenta
-    ]
+    n_clusters = len(np.unique(labels))
 
-    alpha = 0.4
+    # palette daltonisme-compatible pour les 10 clusters
+    cmap = cm.get_cmap("tab10", n_clusters)  #palette de couleurs adapté (daltonisme) = palette colorblind-safe
+    colors = (cmap(range(n_clusters))[:, :3] * 255).astype(np.uint8)
 
-    for k in np.unique(labels):
+    alpha = 0.5
+
+    for k in range(n_clusters):
         mask = labels == k
         overlay[mask] = (
             (1-alpha)*image_rgb[mask] +
-            alpha*np.array(colors[k % len(colors)])
+            alpha*colors[k]
         ).astype(np.uint8)
 
     return overlay
+
 
 
 
@@ -353,6 +354,12 @@ class RicianDenoiser:
         return img_denoised
 
 
+
+
+
+
+
+
 # NLM 
 
 
@@ -446,12 +453,15 @@ if __name__ == "__main__":
 
 
     test_loader = DataLoader(dataset=NucleiDataset(opts, "test"), batch_size=1, shuffle=False)
+
     denoisers = {
-        "linear": LinearGradientDenoiser(kernel_size=51),
-        "gaussian": GaussianDenoiser(),
-        "rician": RicianDenoiser(),
-        "median": MedianDenoiser(),
-        "nlm": NLMDenoiser()
+    "linear": LinearGradientDenoiser(kernel_size=51),
+    "gaussian": GaussianDenoiser(),
+    "rician_0.1": RicianDenoiser(sigma=0.1),
+    "rician_0.5": RicianDenoiser(sigma=0.5),
+    "rician_0.9": RicianDenoiser(sigma=0.9),
+    "median": MedianDenoiser(),
+    "nlm": NLMDenoiser()
     }
 
     # Boucle filtres + segmentation couleur
@@ -507,43 +517,63 @@ if __name__ == "__main__":
             )
 
 
-            # segmentation couleur multiclasse
+           # ================================
+            # SEGMENTATION MULTICLASSE
+            # ================================
+
+            # Image IRM originale en niveaux de gris
+            img_gray = img[0, 0].cpu().numpy()
+            img_gray = ((img_gray + 1) * 127.5).astype(np.uint8)
 
             pred = (prediction[0, 0].cpu().numpy() + 1) / 2.0
-
             H, W = pred.shape
 
-            # gradient = information de contour
+            # Gradient (contours)
             grad_x = sobel(pred, axis=1)
             grad_y = sobel(pred, axis=0)
             grad_mag = np.sqrt(grad_x**2 + grad_y**2)
 
-            # coordonnées normalisées
+            # Coordonnées spatiales
             y_coords, x_coords = np.indices((H, W))
 
-            # construction des features
+            # Features
             X = np.stack([
-                pred,                 # intensité
-                grad_mag,             # information structurelle
-                y_coords / H,         # position verticale
-                x_coords / W          # position horizontale
+                pred,
+                grad_mag,
+                y_coords / H,
+                x_coords / W
             ], axis=-1)
 
             flat = X.reshape(-1, 4)
 
-            kmeans = KMeans(n_clusters=4, random_state=0).fit(flat)
-            labels = kmeans.labels_.reshape(H, W)
-            # Image IRM originale
-            img_gray = img[0, 0].cpu().numpy()
-            img_gray = ((img_gray + 1) * 127.5).astype(np.uint8)
+            # ================================
+            # TEST DIFFÉRENTS N_CLUSTERS
+            # ================================
 
-            # Création overlay couleur
-            overlay = overlay_multiclass(img_gray, labels)
+            for n_clusters in [2, 3, 10]:
 
-            # Sauvegarde
-            plt.figure(figsize=(5,5))
-            plt.imshow(overlay)
-            plt.axis("off")
-            plt.savefig(os.path.join(results_dir, f"overlay_{i:03d}.png"))
-            plt.close()
+                print(f"\n[INFO] Clustering avec {n_clusters} clusters")
 
+                kmeans = KMeans(n_clusters=n_clusters, random_state=0)
+                kmeans.fit(flat)
+
+                labels = kmeans.labels_.reshape(H, W)
+                unique_labels = np.unique(labels) #dire combien d'objets il arrive a reconnaître
+
+                print(f"[RESULT] {name} | image {i}")
+                print(f"Clusters demandés : {n_clusters}")
+                print(f"Clusters détectés : {len(unique_labels)}")
+
+                overlay = overlay_multiclass(img_gray, labels)
+
+                save_path = os.path.join(
+                    results_dir,
+                    f"overlay_{i:03d}_{n_clusters}clusters.png"
+                )
+
+                plt.figure(figsize=(5, 5))
+                plt.imshow(overlay)
+                plt.title(f"{n_clusters} clusters")
+                plt.axis("off")
+                plt.savefig(save_path, bbox_inches="tight", pad_inches=0)
+                plt.close()
