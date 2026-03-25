@@ -1,0 +1,290 @@
+# ============================================================
+# DINOV2 + ATTENTION + SEGMENTATION ANATOMIQUE AVANCÉE
+# ============================================================
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+from PIL import Image
+
+from scipy.ndimage import gaussian_filter, binary_closing, zoom
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler, normalize
+from sklearn.decomposition import PCA
+
+from skimage import exposure, morphology
+from skimage.filters import sobel
+
+import warnings
+warnings.filterwarnings('ignore')
+
+# -------------------------------------------------------------
+# PATHS
+# -------------------------------------------------------------
+INPUT_FOLDER = "/home/myriam/Documents/stage_M2/Stage_2026/code/MASKCONTRAST/prediction"
+OUTPUT_FOLDER = "/home/myriam/Documents/stage_M2/Stage_2026/code/MASKCONTRAST/final_best_results"
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+IMG_EXTENSIONS = {'.png','.jpg','.jpeg','.tif','.tiff'}
+
+# -------------------------------------------------------------
+# PARAMS
+# -------------------------------------------------------------
+IMG_SIZE = 224
+PATCH_SIZE = 14
+N_REGIONS = 10
+
+# -------------------------------------------------------------
+# COLORS
+# -------------------------------------------------------------
+REGIONS = {
+    0: ('Fond', [30,30,30]),
+    1: ('Disque', [255,200,0]),
+    2: ('Sac', [0,180,255]),
+    3: ('Éminence', [180,90,0]),
+    4: ('Psoas G', [220,60,180]),
+    5: ('Psoas D', [80,200,60]),
+    6: ('Multifidus G', [50,160,80]),
+    7: ('Multifidus D', [160,60,200]),
+    8: ('Érecteur G', [40,80,200]),
+    9: ('Érecteur D', [210,190,40]),
+}
+
+# ============================================================
+# LOAD DINOv2
+# ============================================================
+def load_dino(device):
+    import torch
+    model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14', pretrained=True)
+    model.eval().to(device)
+    return model
+
+# ============================================================
+# PREPROCESS
+# ============================================================
+def preprocess(path, size=224):
+    import torchvision.transforms as T
+
+    img = Image.open(path).convert('L')
+    arr = np.array(img).astype(np.float32)
+    arr = (arr - arr.min())/(arr.max()-arr.min()+1e-8)
+
+    # CORRECTION CRITIQUE
+    size = (size // PATCH_SIZE) * PATCH_SIZE   # ← multiple de 14
+
+    img_resized = Image.fromarray((arr*255).astype(np.uint8)).resize((size, size))
+    arr = np.array(img_resized).astype(np.float32) / 255
+
+    arr = gaussian_filter(arr, sigma=1)
+    arr = exposure.equalize_adapthist(arr)
+
+    rgb = Image.merge('RGB',[Image.fromarray((arr*255).astype(np.uint8))]*3)
+
+    t = T.Compose([
+        T.ToTensor(),
+        T.Normalize([0.485]*3,[0.229]*3)
+    ])
+
+    return arr, t(rgb).unsqueeze(0)
+
+# ============================================================
+# FEATURES DINO
+# ============================================================
+def extract_features(model, tensor, device):
+    import torch
+    with torch.no_grad():
+        out = model.get_intermediate_layers(tensor.to(device), n=1, reshape=False)[0]
+    f = out.squeeze(0).cpu().numpy()
+    h = w = int(np.sqrt(f.shape[0]))
+    return f.reshape(h,w,-1)
+
+# ============================================================
+# ATTENTION
+# ============================================================
+def extract_attention(model, tensor, device):
+    import torch
+    with torch.no_grad():
+        attn = model.get_intermediate_layers(tensor.to(device), n=1)[0]
+        attn = attn.mean(-1).flatten()
+    h = w = int(np.sqrt(len(attn)))
+    attn = attn.reshape(h,w).cpu().numpy()
+    attn = (attn - attn.min())/(attn.max()-attn.min()+1e-8)
+    return attn
+
+# ============================================================
+# SEGMENTATION AVANCÉE
+# ============================================================
+def segment(feat_map, img, attn):
+
+    h,w,d = feat_map.shape
+    H,W = img.shape
+
+    # flatten
+    X = feat_map.reshape(-1,d)
+    X = normalize(X)
+
+    # PCA
+    X = PCA(32).fit_transform(X)
+
+    # position anatomique (clé !!)
+    yy,xx = np.mgrid[0:h,0:w]
+    pos = np.stack([
+        yy.flatten()/h,
+        xx.flatten()/w
+    ],axis=1)
+
+    # attention (guide segmentation)
+    attn_flat = attn.flatten()[:,None]
+
+    # gradient (muscles)
+    grad = sobel(img)
+    grad_small = zoom(grad,(h/H,w/W)).flatten()[:,None]
+
+    # concat features
+    X = np.hstack([X, pos*0.5, attn_flat*1.5, grad_small])
+
+    X = StandardScaler().fit_transform(X)
+
+    labels = KMeans(n_clusters=N_REGIONS, n_init=20).fit_predict(X)
+
+    seg = labels.reshape(h,w)
+    seg = zoom(seg,(H/h,W/w),order=0)
+
+    return seg
+
+# ============================================================
+# ASSIGN ANATOMY (TRÈS AMÉLIORÉ)
+# ============================================================
+def assign(seg,img):
+
+    H,W = img.shape
+    cy,cx = H/2,W/2
+
+    props = []
+
+    for k in range(int(seg.max())+1):
+        m = seg==k
+        if m.sum()<20: continue
+        y,x = np.where(m)
+
+        props.append({
+            'k':k,
+            'mean':img[m].mean(),
+            'std':img[m].std(),
+            'cy':y.mean()/H,
+            'cx':x.mean()/W,
+            'dist':np.sqrt((y.mean()/H-0.5)**2+(x.mean()/W-0.5)**2)
+        })
+
+    rem = props.copy()
+
+    def pick(f):
+        b=min(rem,key=f)
+        rem.remove(b)
+        return b['k']
+
+    # sac = très lumineux centre
+    sac = pick(lambda p: -p['mean']*5 + p['dist']*8)
+
+    # disque = intermédiaire + bas
+    disc = pick(lambda p: abs(p['mean']-0.4)+p['cy']*2)
+
+    # fond = sombre
+    fond = pick(lambda p: p['mean'])
+
+    # éminence = sombre + haut
+    emin = pick(lambda p: p['mean'] + (1-p['cy']))
+
+    # séparation gauche droite
+    left  = sorted([p for p in rem if p['cx']<0.5], key=lambda p:p['dist'])
+    right = sorted([p for p in rem if p['cx']>=0.5], key=lambda p:p['dist'])
+
+    mapping = {
+        fond:0,
+        disc:1,
+        sac:2,
+        emin:3
+    }
+
+    # muscles organisés anatomiquement
+    def assign_side(lst, base):
+        if len(lst)>0: mapping[lst[0]['k']] = base      # psoas
+        if len(lst)>1: mapping[lst[1]['k']] = base+2    # multifidus
+        for p in lst[2:]:
+            mapping[p['k']] = base+4            
+
+    assign_side(left,4)
+    assign_side(right,5)
+
+    anat = np.zeros_like(seg)
+
+    for k in range(int(seg.max())+1):
+        anat[seg==k] = mapping.get(k,0)
+
+    # nettoyage
+    for i in range(1,10):
+        m = anat==i
+        m = morphology.remove_small_objects(m,50)
+        m = binary_closing(m, morphology.disk(2))
+        anat[anat==i]=0
+        anat[m]=i
+
+    return anat
+
+# ============================================================
+# VISU
+# ============================================================
+def visualize(img, anat, attn, name):
+
+    color = np.zeros((*img.shape,3),dtype=np.uint8)
+    for k,(n,c) in REGIONS.items():
+        color[anat==k]=c
+
+    attn_full = zoom(attn,(img.shape[0]/attn.shape[0],img.shape[1]/attn.shape[1]))
+
+    plt.figure(figsize=(12,6))
+
+    plt.subplot(1,3,1)
+    plt.imshow(img,cmap='gray')
+    plt.title("IRM")
+
+    plt.subplot(1,3,2)
+    plt.imshow(color)
+    plt.title("Segmentation anatomique")
+
+    plt.subplot(1,3,3)
+    plt.imshow(img,cmap='gray')
+    plt.imshow(attn_full,cmap='jet',alpha=0.5)
+    plt.title("Attention DINO")
+
+    plt.savefig(f"{OUTPUT_FOLDER}/{name}.png")
+    plt.close()
+
+# ============================================================
+# MAIN
+# ============================================================
+if __name__=="__main__":
+
+    import torch
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    model = load_dino(device)
+
+    images = [f for f in os.listdir(INPUT_FOLDER) if Path(f).suffix.lower() in IMG_EXTENSIONS]
+
+    for f in images:
+
+        print("Processing",f)
+
+        img, tensor = preprocess(os.path.join(INPUT_FOLDER,f))
+
+        feat = extract_features(model,tensor,device)
+        attn = extract_attention(model,tensor,device)
+
+        seg  = segment(feat,img,attn)
+        anat = assign(seg,img)
+
+        visualize(img,anat,attn,f)
+
+    print("\nDONE")
